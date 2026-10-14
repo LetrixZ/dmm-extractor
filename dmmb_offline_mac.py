@@ -24,8 +24,10 @@ ORIGINAL bytes to <outdir>. See the .m header + docs/macos.md.
 Usage:
   python3 dmmb_offline_mac.py book.dmmb out_offline [--timeout N] [--build-only]
 
-Outputs: outdir/<idx>_<entry> (original bytes; .dmmj files are JPEGs --
-rename to .jpg if you like), manifest.json (index, sizes, kinds).
+Outputs: outdir/<pos>_<entry> -- pages in reading order, the extension set from
+the detected content kind (.jpg/.png/.zip/.xml) -- plus manifest.json in the
+same layout as the Windows backend (index, name, file, bytes, encrypted,
+expected_size, kind).
 Exit codes: 0 ok, 2 no local license, 3 decrypt failure, 4 usage/io error.
 """
 import json

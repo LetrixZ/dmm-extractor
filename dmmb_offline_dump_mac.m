@@ -31,7 +31,8 @@
 //   per entry: DRM loader + interpreter -> CPContentDecryptor
 //     (mirrors -[__CPIR_9XWutw_U4gqVjnCz __CPIR_NKA6...], which the legacy
 //     decryptorForSummary:/decryptors wrappers never reach for this flavor)
-//   -> original bytes + manifest.json
+//   -> pages in reading order, named after the detected kind, + manifest.json
+//      (same names/manifest layout as the Windows backend; see dmmb_win_common.h)
 //
 // Rationale for hosting out-of-process: the Security Library only finishes
 // init inside a process that runs the startup sequence; DYLD injection into
@@ -87,6 +88,116 @@ static NSString *kindOf(NSData *d) {
   if (n >= 4 && !memcmp(b, "\x89PNG", 4)) return @"png";
   if (n >= 5 && !memcmp(b, "<?xml", 5)) return @"xml";
   return @"bin";
+}
+
+// --- Output helpers: mirror dmmb_win_common.h so both backends write the same
+// --- names and manifest. Keep these in lockstep with the Windows worker.
+
+// Basename after the last '/' or '\' (mirrors dmmb::OutputName's prefix strip).
+static NSString *entryBase(NSString *rawName) {
+  NSString *name = rawName ?: @"";
+  NSRange r = [name rangeOfCharacterFromSet:
+      [NSCharacterSet characterSetWithCharactersInString:@"/\\"]
+      options:NSBackwardsSearch];
+  return r.location == NSNotFound ? name : [name substringFromIndex:r.location + 1];
+}
+
+// "0034.dmmj" -> 34; only purely numeric stems (page ids) qualify.
+// Mirrors dmmb::PageId.
+static BOOL pageIdOf(NSString *rawName, unsigned long long *out) {
+  NSString *base = entryBase(rawName);
+  NSRange dot = [base rangeOfString:@"." options:NSBackwardsSearch];
+  NSString *stem =
+      dot.location == NSNotFound ? base : [base substringToIndex:dot.location];
+  if (stem.length == 0 || stem.length > 18) return NO;
+  unsigned long long v = 0;
+  for (NSUInteger i = 0; i < stem.length; i++) {
+    unichar ch = [stem characterAtIndex:i];
+    if (ch < '0' || ch > '9') return NO;
+    v = v * 10 + (unsigned long long)(ch - '0');
+  }
+  *out = v;
+  return YES;
+}
+
+// Reading order: numeric page ids ascending, then any non-numeric names in
+// physical order (the physical index breaks ties, matching dmmb::ReadingOrder's
+// stable_sort). Mirrors dmmb::ReadingOrder.
+static NSArray<NSNumber *> *readingOrderOf(NSArray *sums) {
+  NSMutableArray<NSNumber *> *order =
+      [NSMutableArray arrayWithCapacity:sums.count];
+  for (NSUInteger i = 0; i < sums.count; i++) [order addObject:@(i)];
+  [order sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+    NSUInteger ia = a.unsignedIntegerValue, ib = b.unsignedIntegerValue;
+    unsigned long long pa = 0, pb = 0;
+    BOOL va = pageIdOf([sums[ia] filename], &pa);
+    BOOL vb = pageIdOf([sums[ib] filename], &pb);
+    if (va != vb) return va ? NSOrderedAscending : NSOrderedDescending;
+    if (va && pa != pb) return pa < pb ? NSOrderedAscending : NSOrderedDescending;
+    if (ia != ib) return ia < ib ? NSOrderedAscending : NSOrderedDescending;
+    return NSOrderedSame;
+  }];
+  return order;
+}
+
+// "%04lu_<safe base>": sanitise Windows-invalid characters, trim trailing
+// dots/spaces, fall back to entry-<n>, cap the component. Mirrors
+// dmmb::OutputName (NSString lengths are UTF-16 code units, like std::wstring).
+static NSString *outputNameOf(NSString *rawName, NSUInteger position) {
+  NSString *base = entryBase(rawName);
+  NSCharacterSet *bad =
+      [NSCharacterSet characterSetWithCharactersInString:@"<>:\"/\\|?*"];
+  NSMutableString *safe = [NSMutableString stringWithCapacity:base.length];
+  for (NSUInteger i = 0; i < base.length; i++) {
+    unichar ch = [base characterAtIndex:i];
+    [safe appendFormat:@"%C",
+        (unichar)((ch < 32 || [bad characterIsMember:ch]) ? (unichar)'_' : ch)];
+  }
+  base = safe;
+  while (base.length && ([base hasSuffix:@"."] || [base hasSuffix:@" "]))
+    base = [base substringToIndex:base.length - 1];
+  if (!base.length)
+    base = [NSString stringWithFormat:@"entry-%lu", (unsigned long)position];
+  if (base.length > 200) {
+    base = [base substringToIndex:200];
+    unichar last = [base characterAtIndex:base.length - 1];
+    if (last >= 0xd800 && last <= 0xdbff)
+      base = [base substringToIndex:base.length - 1];
+  }
+  return [NSString stringWithFormat:@"%04lu_%@", (unsigned long)position, base];
+}
+
+// Give decrypted images an extension Windows opens by double-click; unknown
+// kinds keep the original extension. Mirrors dmmb::WithKindExtension.
+static NSString *withKindExtension(NSString *name, NSString *kind) {
+  NSString *ext = nil;
+  if ([kind isEqualToString:@"jpeg"]) ext = @"jpg";
+  else if ([kind isEqualToString:@"png"]) ext = @"png";
+  else if ([kind isEqualToString:@"zip"]) ext = @"zip";
+  else if ([kind isEqualToString:@"xml"]) ext = @"xml";
+  else return name;
+  NSRange dot = [name rangeOfString:@"." options:NSBackwardsSearch];
+  NSRange sep = [name rangeOfCharacterFromSet:
+      [NSCharacterSet characterSetWithCharactersInString:@"/\\"]
+      options:NSBackwardsSearch];
+  BOOL hasExt = dot.location != NSNotFound && dot.location != 0 &&
+                (sep.location == NSNotFound || dot.location > sep.location);
+  return hasExt
+      ? [[name substringToIndex:dot.location + 1] stringByAppendingString:ext]
+      : [name stringByAppendingFormat:@".%@", ext];
+}
+
+// Quote/escape exactly like dmmb::Json so manifest.json is byte-identical.
+static NSString *jsonString(NSString *s) {
+  NSMutableString *out = [NSMutableString stringWithString:@"\""];
+  for (NSUInteger i = 0; i < s.length; i++) {
+    unichar ch = [s characterAtIndex:i];
+    if (ch == '"' || ch == '\\') [out appendFormat:@"\\%C", ch];
+    else if (ch < 32) [out appendFormat:@"\\u%04x", (unsigned)ch];
+    else [out appendFormat:@"%C", ch];
+  }
+  [out appendString:@"\""];
+  return out;
 }
 
 int main(int argc, const char *argv[]) {
@@ -262,16 +373,15 @@ int main(int argc, const char *argv[]) {
                               withIntermediateDirectories:YES
                                                attributes:nil
                                                     error:NULL];
-    NSMutableArray *manifest = [NSMutableArray array];
-    NSUInteger ok = 0, fail = 0, i = 0;
-    for (id s in sums) {
-      NSString *name = [s filename];
-      NSString *base = [name lastPathComponent];
-      if (!base.length)
-        base = [NSString stringWithFormat:@"entry-%lu", (unsigned long)i];
-      NSString *dest = [outdir stringByAppendingPathComponent:
-                        [NSString stringWithFormat:@"%04lu_%@",
-                                                   (unsigned long)i, base]];
+    // Pages come out in reading order (ascending page id) with a kind-based
+    // extension; the manifest matches the Windows worker byte for byte.
+    NSArray<NSNumber *> *order = readingOrderOf(sums);
+    NSMutableString *manifest = [NSMutableString stringWithString:@"[\n"];
+    NSUInteger ok = 0, fail = 0;
+    for (NSUInteger position = 0; position < order.count; position++) {
+      id s = sums[order[position].unsignedIntegerValue];
+      NSString *name = [s filename] ?: @"";
+      NSString *stem = outputNameOf(name, position);
       NSData *plain = nil;
       @try {
         SEL ls = [s isZipped] ? lz : lp;
@@ -296,34 +406,36 @@ int main(int argc, const char *argv[]) {
           NSError *derr = nil;
           plain = df(dec, od, &derr);
           if (!plain)
-            fprintf(stderr, "entry %s: %s\n", base.UTF8String ?: "?",
+            fprintf(stderr, "entry %s: %s\n", stem.UTF8String ?: "?",
                     derr.description.UTF8String ?: "?");
         }
       } @catch (NSException *x) {
-        fprintf(stderr, "entry %s: exception %s\n", base.UTF8String ?: "?",
+        fprintf(stderr, "entry %s: exception %s\n", stem.UTF8String ?: "?",
                 x.reason.UTF8String ?: "?");
       }
+      NSString *kind = plain ? kindOf(plain) : nil;
+      NSString *file = plain ? withKindExtension(stem, kind) : stem;
+      NSString *dest = [outdir stringByAppendingPathComponent:file];
       if (!plain || ![plain writeToFile:dest atomically:YES]) {
-        fail++; i++; continue;
+        fail++; continue;
       }
-      ok++;
-      [manifest addObject:@{
-        @"index": @(i), @"name": name ?: @"",
-        @"file": dest.lastPathComponent,
-        @"bytes": @(plain.length),
-        @"encrypted": @([s isEncrypted]),
-        @"expected_size": @([s filesize]),
-        @"kind": kindOf(plain),
-      }];
-      if ((i % 20) == 0) fprintf(stderr, "[%lu/%lu]\n",
-                                 (unsigned long)i, (unsigned long)sums.count);
-      i++;
+      if (ok++) [manifest appendString:@",\n"];
+      [manifest appendFormat:
+        @"  {\"index\": %lu, \"name\": %@, \"file\": %@, \"bytes\": %lu, "
+        @"\"encrypted\": %@, \"expected_size\": %llu, \"kind\": %@}",
+        (unsigned long)position, jsonString(name), jsonString(file),
+        (unsigned long)plain.length,
+        [s isEncrypted] ? @"true" : @"false",
+        (unsigned long long)[s filesize], jsonString(kind)];
+      if ((position % 20) == 0) fprintf(stderr, "[%lu/%lu]\n",
+                                        (unsigned long)position,
+                                        (unsigned long)order.count);
     }
-    NSData *mj = [NSJSONSerialization dataWithJSONObject:manifest
-                                                options:NSJSONWritingPrettyPrinted
-                                                  error:NULL];
-    [mj writeToFile:[outdir stringByAppendingPathComponent:@"manifest.json"]
-         atomically:YES];
+    [manifest appendString:@"\n]\n"];
+    [manifest writeToFile:[outdir stringByAppendingPathComponent:@"manifest.json"]
+               atomically:YES
+                 encoding:NSUTF8StringEncoding
+                    error:NULL];
     fprintf(stderr, "done: %lu ok, %lu failed -> %s\n",
             (unsigned long)ok, (unsigned long)fail, argv[2]);
     return fail ? 3 : 0;
