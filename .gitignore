@@ -1,0 +1,28 @@
+# --- build artifacts (Windows host + worker) ---------------------------------
+build/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.exe
+*.dll
+dmmb_offline_dump_mac
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.pyc
+
+# --- extracted output --------------------------------------------------------
+out/
+out_*/
+pages_out/
+
+# --- licensed sample books (large and copyrighted: never commit) -------------
+*.dmmb
+
+# --- macOS / editors ---------------------------------------------------------
+.DS_Store
+._*
+*.swp
+.idea/
+.vs/
