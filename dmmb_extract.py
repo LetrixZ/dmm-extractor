@@ -2,9 +2,15 @@
 """
 dmmb_extract.py -- extract original page images for a DMM doujin you own.
 
+Cross-platform (macOS / Windows / Linux): pure Python 3 stdlib, no native build
+and no license store -- it needs only your own DMM session cookies. This is the
+primary method; the native offline extractors are per-platform alternatives.
+
 What it does:
   1. Parses the UNENCRYPTED structure of a .dmmb capsule (INI / DNBF / DNBA /
-     index.bin manifest) and writes manifest.json + any plaintext entries.
+     index.bin manifest) and writes manifest.json + plaintext entries at the
+     top level, named NNNN_<name> in reading order (same layout as the offline
+     tools; see Outputs below).
   2. Downloads the ORIGINAL page JPEGs through the official DMM web viewer
      APIs using YOUR OWN DMM session cookies (login_secure_id /
      login_session_id, or a full Cookie header). Same account that owns the
@@ -33,10 +39,11 @@ Examples:
   python3 dmmb_extract.py --dmmb book.dmmb --doujin-id d_012345 --out pages_out --manifest-only
   python3 dmmb_extract.py --dmmb book.dmmb --dry-run
 
-Outputs in --out:
-  manifest.json      parsed capsule + download plan
-  clear/             plaintext capsule entries (index.bin, ...)
-  pages/*.jpg        original page images (cover first)
+Outputs in --out (same file layout as the offline tools):
+  NNNN_<name>.jpg    original page images, in reading order (cover first)
+  NNNN_<name>        plaintext capsule entries (e.g. 0102_index.bin)
+  manifest.json      parsed capsule + download plan (rich object)
+  enc/               raw encrypted .dmmj payloads (only with --dump-enc)
 """
 import argparse
 import base64
@@ -173,6 +180,65 @@ def parse_dmmb(path):
              if idx else [])
     return {"data": data, "metadata": meta, "footer": foot,
             "entries": entries, "index_files": files, "index_entry": idx}
+
+
+# ---------------------------------------- names / reading order (match offline:
+# dmmb::ReadingOrder / OutputName / WithKindExtension in dmmb_win_common.h)
+def entry_basename(name):
+    return (name or "").replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def page_id(name):
+    """Numeric page id from an entry name ("0034.dmmj" -> 34), else None."""
+    base = entry_basename(name)
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    if not stem or len(stem) > 18 or not all("0" <= c <= "9" for c in stem):
+        return None
+    return int(stem)
+
+
+def reading_order(entries):
+    """Numeric page ids ascending, then non-numeric names in physical order."""
+    def key(i):
+        pid = page_id(entries[i]["name"])
+        return (0, pid, i) if pid is not None else (1, 0, i)
+    return sorted(range(len(entries)), key=key)
+
+
+def output_name(name, position):
+    base = entry_basename(name)
+    safe = "".join("_" if (ord(c) < 32 or c in '<>:"/\\|?*') else c
+                   for c in base)
+    safe = safe.rstrip(". ")
+    if not safe:
+        safe = f"entry-{position}"
+    if len(safe) > 200:
+        safe = safe[:200]
+        if 0xD800 <= ord(safe[-1]) <= 0xDBFF:
+            safe = safe[:-1]
+    return f"{position:04d}_{safe}"
+
+
+def with_kind_extension(name, kind):
+    ext = {"jpeg": "jpg", "png": "png", "zip": "zip", "xml": "xml"}.get(kind)
+    if not ext:
+        return name
+    dot = name.rfind(".")
+    sep = max(name.rfind("/"), name.rfind("\\"))
+    has_ext = dot != -1 and dot != 0 and (sep == -1 or dot > sep)
+    return (name[:dot + 1] + ext) if has_ext else (name + "." + ext)
+
+
+def kind_of(blob):
+    if blob[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if blob[:2] == b"PK":
+        return "zip"
+    if blob[:4] == b"\x89PNG":
+        return "png"
+    if blob[:5] == b"<?xml":
+        return "xml"
+    return "bin"
 
 
 # ----------------------------------------------------------------- HTTP layer
@@ -335,20 +401,34 @@ def main(argv=None):
           f"{len(entries) - enc} plaintext), index list: {len(files)} files")
 
     os.makedirs(a.out, exist_ok=True)
-    cleardir = os.path.join(a.out, "clear")
-    os.makedirs(cleardir, exist_ok=True)
-    for e in entries:
-        if not e["encrypted"]:
-            p = os.path.join(cleardir, os.path.basename(e["name"]))
-            if a.overwrite or not os.path.exists(p):
-                with open(p, "wb") as f:
-                    f.write(data[e["data_offset"]:e["data_offset"] + e["size"]])
+    # Reading order + per-entry output names, identical to the offline tools.
+    order = reading_order(entries)
+    position_of = {idx: pos for pos, idx in enumerate(order)}
+    page_by_id = {}
+    for idx, e in enumerate(entries):
+        pid = page_id(e["name"])
+        if pid is not None:
+            page_by_id[pid] = (position_of[idx], e)
+
+    # Plaintext capsule entries (e.g. index.bin) go to the top level too.
+    clear_written = 0
+    for idx, e in enumerate(entries):
+        if e["encrypted"]:
+            continue
+        blob = data[e["data_offset"]:e["data_offset"] + e["size"]]
+        dest = with_kind_extension(output_name(e["name"], position_of[idx]),
+                                   kind_of(blob))
+        p = os.path.join(a.out, dest)
+        if a.overwrite or not os.path.exists(p):
+            with open(p, "wb") as f:
+                f.write(blob)
+        clear_written += 1
     if a.dump_enc:
         encdir = os.path.join(a.out, "enc")
         os.makedirs(encdir, exist_ok=True)
         for e in entries:
             if e["encrypted"]:
-                p = os.path.join(encdir, os.path.basename(e["name"]) + ".enc")
+                p = os.path.join(encdir, entry_basename(e["name"]) + ".enc")
                 if a.overwrite or not os.path.exists(p):
                     with open(p, "wb") as f:
                         f.write(data[e["data_offset"]:e["data_offset"] + e["size"]])
@@ -358,6 +438,8 @@ def main(argv=None):
                 "entries": [{k: e[k] for k in ("name", "size", "encrypted",
                                               "flag", "layout")} for e in entries],
                 "index_files": files, "doujin_id": a.doujin_id,
+                "layout": ("pages written to <out> as NNNN_<name>.<kind>, in "
+                           "reading order -- same layout as the offline tools"),
                 "note": ("Encrypted .dmmj payloads are NOT decrypted locally; "
                          "page images below come from the licensed web viewer.")}
 
@@ -367,12 +449,12 @@ def main(argv=None):
             else a.cloudfront_cookie
     if a.dry_run or a.manifest_only or not cookie:
         if not cookie and not (a.dry_run or a.manifest_only):
-            print("no DMM session cookie given; wrote manifest + clear/ only.",
-                  file=sys.stderr)
+            print("no DMM session cookie given; wrote manifest + plaintext "
+                  "entries only.", file=sys.stderr)
         manifest["pages"] = []
         json.dump(manifest, open(os.path.join(a.out, "manifest.json"), "w"),
                   indent=2, ensure_ascii=False)
-        print(f"wrote {a.out}/manifest.json + {len(os.listdir(cleardir))} clear files")
+        print(f"wrote {a.out}/manifest.json + {clear_written} plaintext files")
         return 0
 
     if not a.doujin_id and not a.reader_id:
@@ -399,29 +481,41 @@ def main(argv=None):
         raise SystemExit("cannot derive content root (no icon URL in library)")
     print(f"content root: {root}, pages: {len(contents)}")
 
-    pages, pagedir = [], os.path.join(a.out, "pages")
-    os.makedirs(pagedir, exist_ok=True)
+    pages = []
     for i, c in enumerate(contents):
         xhtml = c.get("file", "")
-        stem = os.path.splitext(os.path.basename(xhtml.replace("\\", "/")))[0]
+        stem = os.path.splitext(entry_basename(xhtml))[0]
+        pid = int(stem) if (stem and len(stem) <= 18 and
+                            all("0" <= ch <= "9" for ch in stem)) else None
+        entry = None
+        if pid is not None and pid in page_by_id:
+            position, entry = page_by_id[pid]
+            name = entry["name"]
+        else:
+            position, name = i, stem
         url = f"{root}/item/xhtml/{stem}.xhtml/0.jpeg"
-        outp = os.path.join(pagedir, f"{i:04d}_{stem}.jpg")
+        outp = os.path.join(a.out, with_kind_extension(
+            output_name(name, position), "jpeg"))
+        rel = os.path.basename(outp)
+        page = {"index": position, "name": name, "file": rel, "kind": "jpeg",
+                "xhtml": xhtml, "url": url}
+        if entry is not None:
+            page["encrypted"] = True
+            page["expected_size"] = entry["size"]
         if os.path.exists(outp) and not a.overwrite:
-            pages.append({"index": i, "xhtml": xhtml, "url": url,
-                          "file": os.path.basename(outp), "cached": True})
+            pages.append({**page, "cached": True})
             continue
         blob = download_page(cookie, url)
         with open(outp, "wb") as f:
             f.write(blob)
-        pages.append({"index": i, "xhtml": xhtml, "url": url,
-                      "file": os.path.basename(outp), "bytes": len(blob)})
+        pages.append({**page, "bytes": len(blob)})
         print(f"[{i + 1}/{len(contents)}] {stem} {len(blob)} bytes")
     manifest["reader_id"] = reader_id
     manifest["content_root"] = root
     manifest["pages"] = pages
     json.dump(manifest, open(os.path.join(a.out, "manifest.json"), "w"),
               indent=2, ensure_ascii=False)
-    print(f"done: {len(pages)} images in {pagedir}")
+    print(f"done: {len(pages)} images in {a.out}")
     return 0
 
 
